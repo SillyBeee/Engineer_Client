@@ -1,6 +1,7 @@
 {
-    "mqtt_host": "192.168.12.1",
+    "mqtt_host": "127.0.0.1",
     "mqtt_port": 3333,
-    "mqtt_client_id": "",
-    "urdf_path": "arm_description/urdf/Engineer2.urdf"
+    "mqtt_client_id": "urdf_viewer",
+    "urdf_path": "arm_description/urdf/Engineer2.urdf",
+    "trajectory_duration": 2.0
 }
