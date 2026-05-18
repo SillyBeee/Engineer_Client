@@ -76,7 +76,7 @@ void MqttClient::SetConfig(const std::string& ip, int port, const std::string& c
 MqttClient::~MqttClient() {
     try {
         if (client_) {
-            client_->disconnect()->wait_for(std::chrono::seconds(3));
+            if (connected_) client_->disconnect()->wait_for(std::chrono::seconds(3));
             client_->stop_consuming();
         }
     } catch (...) {}
@@ -96,14 +96,16 @@ bool MqttClient::Connect()
         client_->set_callback(*client_cb_);
 
         client_->start_consuming();
-        LOG_INFO("Connecting to MQTT server...");
-        client_->connect(connect_options);
-        LOG_INFO("MQTT connect initiated (non-blocking) to {}:{}", ip_, port_);
+        LOG_INFO("Connecting to MQTT server {}:{} ...", ip_, port_);
+        auto token = client_->connect(connect_options);
+        token->wait();
+        LOG_INFO("MQTT connected successfully to {}:{}", ip_, port_);
+        connected_ = true;
         return true;
     }
     catch (const mqtt::exception& e)
     {
-        LOG_WARN("MQTT connect initiation failed to {}:{} - {}", ip_, port_, e.what());
+        LOG_WARN("MQTT connect failed to {}:{} - {}", ip_, port_, e.what());
         try { client_->stop_consuming(); } catch (...) {}
         return false;
     }
@@ -113,9 +115,11 @@ bool MqttClient::Disconnect()
 {
     try
     {
+        if (!connected_) { connected_ = false; return true; }
         LOG_INFO("Disconnecting from MQTT server...");
         client_->disconnect()->wait_for(std::chrono::seconds(3));
         client_->stop_consuming();
+        connected_ = false;
         LOG_INFO("Disconnected from MQTT server.");
         return true;
     }
@@ -401,23 +405,8 @@ void MqttClient::MessageCallback(mqtt::const_message_ptr msg)
         CustomByteBlock status;
         if (status.ParseFromString(payload)) {
             std::vector<uint8_t> packet_data(status.data().begin(), status.data().end());
-            using Clock = std::chrono::steady_clock;
-            static auto window_begin = Clock::now();
-            static uint64_t window_packets = 0;
-            static uint64_t window_bytes = 0;
-            static uint64_t total_packets = 0;
-            ++window_packets;
-            window_bytes += packet_data.size();
-            ++total_packets;
-
-            const auto now = Clock::now();
-            if (now - window_begin >= std::chrono::seconds(1)) {
-                LOG_INFO("MQTT CustomByteBlock rx={} pkts/s, {} bytes/s, total={}",
-                         window_packets, window_bytes, total_packets);
-                window_begin = now;
-                window_packets = 0;
-                window_bytes = 0;
-            }
+            LOG_INFO("MQTT Get CustomByteBlock");
+            
             std::function<void(const std::vector<uint8_t>&)> handler;
             {
                 std::lock_guard<std::mutex> lock(handler_mutex_);

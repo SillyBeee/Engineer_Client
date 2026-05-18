@@ -110,8 +110,10 @@ int main(int argc, char** argv) {
         try {
             std::ifstream f(config_path);
             json j; f >> j;
+            mqtt_host  = j.value("mqtt_host",  mqtt_host);
+            mqtt_port  = j.value("mqtt_port",  mqtt_port);
+            mqtt_client_id = j.value("mqtt_client_id", j.value("default_mqtt_client_id", mqtt_client_id));
             if (urdf_path.empty()) urdf_path = j.value("urdf_path", urdf_path);
-            mqtt_client_id = j.value("default_mqtt_client_id", mqtt_client_id);
             LOG_INFO("Loaded config from {}", config_path);
         } catch (const std::exception& e) {
             LOG_WARN("Failed to parse config: {}", e.what());
@@ -124,6 +126,12 @@ int main(int argc, char** argv) {
 
     if (!std::filesystem::exists(urdf_path)) {
         LOG_ERROR("URDF file not found: {}", urdf_path);
+        return 1;
+    }
+
+    drivers::MqttClient mqtt_client(mqtt_host, mqtt_port, mqtt_client_id);
+    if (!mqtt_client.Connect()) {
+        LOG_ERROR("MQTT connection failed, exiting");
         return 1;
     }
 
@@ -162,26 +170,7 @@ int main(int argc, char** argv) {
     std::mutex traj_mutex;
     std::vector<double> current_joint_positions(num_joints, 0.0);
 
-    drivers::MqttClient mqtt_client(mqtt_host, mqtt_port, mqtt_client_id);
 
-    mqtt_client.SetUnhandledTopicCallback(
-        [&](const std::string& topic, const std::string& payload) {
-            if (topic == "target_joint_pose") {
-                try {
-                    json arr = json::parse(payload);
-                    if (!arr.is_array() || arr.size() != num_joints) return;
-                    std::vector<double> target(num_joints);
-                    for (size_t i = 0; i < num_joints; ++i) target[i] = arr[i].get<double>();
-                    std::vector<double> current;
-                    { std::lock_guard<std::mutex> lock(traj_mutex); current = current_joint_positions; }
-                    auto traj = planner.PlanToTarget(current, target, 5.0);
-                    { std::lock_guard<std::mutex> lock(traj_mutex); executor.Start(traj); }
-                } catch (...) {}
-            }
-        });
-
-    bool mqtt_ok = mqtt_client.Connect();
-    if (!mqtt_ok) LOG_WARN("MQTT connection failed, continuing without MQTT");
 
     double idle_time = 0.0;
     int frame_count = 0;
@@ -190,7 +179,7 @@ int main(int argc, char** argv) {
     cv::namedWindow("URDF Robot Viewer (MQTT+URDF Renderer)", cv::WINDOW_NORMAL);
     cv::setMouseCallback("URDF Robot Viewer (MQTT+URDF Renderer)", on_mouse, &orbit_cam);
 
-    LOG_INFO("Starting render loop. Send target via MQTT topic 'target_joint_pose' as JSON array.");
+    LOG_INFO("Starting render loop.");
     LOG_INFO("Mouse: left-drag to orbit, scroll to zoom. Press 'q' to quit.");
 
     while (g_running) {

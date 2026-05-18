@@ -94,6 +94,7 @@ private:
     int port_;
     std::string client_id_;
 
+    bool connected_ = false;
     std::mutex handler_mutex_;
     std::function<void(const std::vector<uint8_t>&)> custom_byte_block_handler_;
     std::function<void(const std::string&, const std::string&)> unhandled_topic_callback_;
