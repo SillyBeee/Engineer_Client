@@ -14,20 +14,63 @@
 
 using json = nlohmann::json;
 
-struct AppConfig {
-    std::string mqtt_host = "127.0.0.1";
-    int mqtt_port = 3333;
-    std::string mqtt_client_id = "urdf_viewer";
-    std::string urdf_path = "arm_description/urdf/Engineer2.urdf";
-    double trajectory_duration = 2.0;
+static std::atomic<bool> g_running{true};
+static void signal_handler(int) { g_running = false; }
 
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(AppConfig, mqtt_host, mqtt_port, mqtt_client_id, urdf_path, trajectory_duration)
+struct OrbitCamera {
+    double distance = 2.74;
+    double yaw = -0.32;
+    double pitch = -0.18;
+    double look_at[3] = {0.0, 0.0, 0.5};
+    double fov = 50.0f;
+    bool dirty = false;
+    std::mutex mtx;
+
+    void apply(drivers::URDFRendererPlugin& renderer) {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (!dirty) return;
+        drivers::UrdfCameraConfig cam;
+        cam.position[0] = look_at[0] + distance * cos(pitch) * sin(yaw);
+        cam.position[1] = look_at[1] + distance * sin(pitch);
+        cam.position[2] = look_at[2] + distance * cos(pitch) * cos(yaw);
+        cam.look_at[0] = look_at[0];
+        cam.look_at[1] = look_at[1];
+        cam.look_at[2] = look_at[2];
+        cam.up[0] = 0.0f; cam.up[1] = 1.0f; cam.up[2] = 0.0f;
+        cam.fov_degrees = fov;
+        cam.near_clip = 0.02f;
+        cam.far_clip = 20.0f;
+        renderer.setCamera(cam);
+        dirty = false;
+    }
+    void orbit(double dx, double dy) {
+        std::lock_guard<std::mutex> lock(mtx);
+        yaw += dx * 0.005;
+        pitch += dy * 0.005;
+        pitch = std::max(-1.5, std::min(1.5, pitch));
+        dirty = true;
+    }
+    void zoom(double delta) {
+        std::lock_guard<std::mutex> lock(mtx);
+        distance *= (1.0 + delta * 0.02);
+        distance = std::max(0.5, std::min(20.0, distance));
+        dirty = true;
+    }
 };
 
-static std::atomic<bool> g_running{true};
-
-static void signal_handler(int) {
-    g_running = false;
+static void on_mouse(int event, int x, int y, int flags, void* userdata) {
+    auto* cam = static_cast<OrbitCamera*>(userdata);
+    static int prev_x = -1, prev_y = -1;
+    if (event == cv::EVENT_LBUTTONDOWN) { prev_x = x; prev_y = y; }
+    else if (event == cv::EVENT_MOUSEMOVE && (flags & cv::EVENT_FLAG_LBUTTON)) {
+        if (prev_x >= 0 && prev_y >= 0) {
+            cam->orbit(x - prev_x, y - prev_y);
+            prev_x = x; prev_y = y;
+        }
+    } else if (event == cv::EVENT_LBUTTONUP) { prev_x = prev_y = -1; }
+    else if (event == cv::EVENT_MOUSEWHEEL) {
+        cam->zoom(((flags >> 16) & 0xFFFF) > 0 ? 1.0 : -1.0);
+    }
 }
 
 static void print_usage(const char* prog) {
@@ -43,59 +86,41 @@ static void print_usage(const char* prog) {
 }
 
 int main(int argc, char** argv) {
-    AppConfig cfg;
-    std::string config_path;
-
-    for (int i = 1; i < argc; ++i) {
-        std::string arg(argv[i]);
-        if (arg == "--config" && i + 1 < argc) {
-            config_path = argv[++i];
-        } else if (arg == "--mqtt-host" && i + 1 < argc) {
-            cfg.mqtt_host = argv[++i];
-        } else if (arg == "--mqtt-port" && i + 1 < argc) {
-            cfg.mqtt_port = std::stoi(argv[++i]);
-        } else if (arg == "--urdf-path" && i + 1 < argc) {
-            cfg.urdf_path = argv[++i];
-        } else if (arg == "--help") {
-            print_usage(argv[0]);
-            return 0;
-        }
-    }
-
     logger::Logger::GetInstance().Init();
-
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
     auto src = std::filesystem::path(PROJECT_SOURCE_DIR);
+    std::string config_path = (src / "config" / "client_setting.json").string();
+    std::string mqtt_host = "127.0.0.1";
+    int mqtt_port = 3333;
+    std::string mqtt_client_id = "3";
+    std::string urdf_path;
 
-    if (config_path.empty()) {
-        config_path = (src / "config" / "client_setting.json").string();
+    for (int i = 1; i < argc; ++i) {
+        std::string arg(argv[i]);
+        if (arg == "--config" && i + 1 < argc) config_path = argv[++i];
+        else if (arg == "--mqtt-host" && i + 1 < argc) mqtt_host = argv[++i];
+        else if (arg == "--mqtt-port" && i + 1 < argc) mqtt_port = std::stoi(argv[++i]);
+        else if (arg == "--urdf-path" && i + 1 < argc) urdf_path = argv[++i];
+        else if (arg == "--help") { print_usage(argv[0]); return 0; }
     }
 
     if (std::filesystem::exists(config_path)) {
         try {
-            std::ifstream file(config_path);
-            json j;
-            file >> j;
-            AppConfig file_cfg = j.get<AppConfig>();
-            if (cfg.mqtt_host == "127.0.0.1") cfg.mqtt_host = file_cfg.mqtt_host;
-            if (cfg.mqtt_port == 3333) cfg.mqtt_port = file_cfg.mqtt_port;
-            if (cfg.mqtt_client_id == "urdf_viewer") cfg.mqtt_client_id = file_cfg.mqtt_client_id;
-            if (cfg.urdf_path == "arm_description/urdf/Engineer2.urdf") cfg.urdf_path = file_cfg.urdf_path;
-            cfg.trajectory_duration = file_cfg.trajectory_duration;
+            std::ifstream f(config_path);
+            json j; f >> j;
+            if (urdf_path.empty()) urdf_path = j.value("urdf_path", urdf_path);
+            mqtt_client_id = j.value("default_mqtt_client_id", mqtt_client_id);
             LOG_INFO("Loaded config from {}", config_path);
         } catch (const std::exception& e) {
-            LOG_WARN("Failed to parse config file {}: {}", config_path, e.what());
+            LOG_WARN("Failed to parse config: {}", e.what());
         }
-    } else {
-        LOG_INFO("No config file found at {}, using defaults", config_path);
     }
 
-    std::string urdf_path = cfg.urdf_path;
-    if (!std::filesystem::path(urdf_path).is_absolute()) {
+    if (urdf_path.empty()) urdf_path = "arm_description/urdf/Engineer2.urdf";
+    if (!std::filesystem::path(urdf_path).is_absolute())
         urdf_path = (src / urdf_path).string();
-    }
 
     if (!std::filesystem::exists(urdf_path)) {
         LOG_ERROR("URDF file not found: {}", urdf_path);
@@ -110,31 +135,25 @@ int main(int argc, char** argv) {
     render_cfg.anti_aliasing = 0;
 
     if (!renderer.initialize(&render_cfg)) {
-        LOG_ERROR("URDF renderer init failed: {}", renderer.getLastError());
+        LOG_ERROR("Renderer init failed: {}", renderer.getLastError());
         return 1;
     }
-
     if (renderer.loadURDF(urdf_path) != drivers::URDF_SUCCESS) {
         LOG_ERROR("URDF load failed: {}", renderer.getLastError());
         return 1;
     }
     LOG_INFO("URDF loaded: {} ({} joints)", urdf_path, renderer.getJointCount());
 
-    drivers::UrdfCameraConfig cam;
-    cam.position[0] = -1.0f; cam.position[1] = -0.5f; cam.position[2] = 3.0f;
-    cam.look_at[0] = 0.0f; cam.look_at[1] = 0.0f; cam.look_at[2] = 0.5f;
-    cam.up[0] = 0.0f; cam.up[1] = 0.0f; cam.up[2] = 1.0f;
-    cam.fov_degrees = 50.0f;
-    cam.near_clip = 0.02f;
-    cam.far_clip = 20.0f;
-    renderer.setCamera(cam);
+    OrbitCamera orbit_cam;
+    orbit_cam.dirty = true;
+    orbit_cam.apply(renderer);
 
     URDFMotionPlanner planner;
     if (!planner.LoadURDF(urdf_path)) {
-        LOG_ERROR("URDFMotionPlanner init failed");
+        LOG_ERROR("Planner init failed");
         return 1;
     }
-    LOG_INFO("URDFMotionPlanner: {} joints, bounds loaded from URDF", planner.num_joints());
+    LOG_INFO("URDFMotionPlanner: {} joints", planner.num_joints());
 
     auto joint_names = planner.getJointNames();
     size_t num_joints = joint_names.size();
@@ -143,62 +162,36 @@ int main(int argc, char** argv) {
     std::mutex traj_mutex;
     std::vector<double> current_joint_positions(num_joints, 0.0);
 
-    drivers::MqttClient mqtt_client(cfg.mqtt_host, cfg.mqtt_port, cfg.mqtt_client_id);
-    LOG_INFO("MQTT config: {}:{} client_id={}", cfg.mqtt_host, cfg.mqtt_port, cfg.mqtt_client_id);
+    drivers::MqttClient mqtt_client(mqtt_host, mqtt_port, mqtt_client_id);
 
-    mqtt_client.SetMessageCallback(
+    mqtt_client.SetUnhandledTopicCallback(
         [&](const std::string& topic, const std::string& payload) {
             if (topic == "target_joint_pose") {
                 try {
                     json arr = json::parse(payload);
-                    if (!arr.is_array() || arr.size() != num_joints) {
-                        LOG_WARN("target_joint_pose: expected {} floats, got {}", num_joints, arr.size());
-                        return;
-                    }
+                    if (!arr.is_array() || arr.size() != num_joints) return;
                     std::vector<double> target(num_joints);
-                    for (size_t i = 0; i < num_joints; ++i) {
-                        target[i] = arr[i].get<double>();
-                    }
+                    for (size_t i = 0; i < num_joints; ++i) target[i] = arr[i].get<double>();
                     std::vector<double> current;
-                    {
-                        std::lock_guard<std::mutex> lock(traj_mutex);
-                        current = current_joint_positions;
-                    }
-                    auto traj = planner.PlanToTarget(current, target, cfg.trajectory_duration);
-                    LOG_INFO("Planned trajectory: {} points -> {} points ({}->{} sec)",
-                             traj.points.size(), current.size(), target.size(),
-                             cfg.trajectory_duration);
-                    {
-                        std::lock_guard<std::mutex> lock(traj_mutex);
-                        executor.Start(traj);
-                    }
-                } catch (const std::exception& e) {
-                    LOG_WARN("Failed to parse target_joint_pose: {}", e.what());
-                }
-            } else if (topic == "RobotDynamicStatus" || topic == "RobotPosition") {
-                LOG_INFO("MQTT topic={} size={}", topic, payload.size());
-            } else {
-                LOG_INFO("MQTT topic={} size={}", topic, payload.size());
+                    { std::lock_guard<std::mutex> lock(traj_mutex); current = current_joint_positions; }
+                    auto traj = planner.PlanToTarget(current, target, 5.0);
+                    { std::lock_guard<std::mutex> lock(traj_mutex); executor.Start(traj); }
+                } catch (...) {}
             }
         });
 
     bool mqtt_ok = mqtt_client.Connect();
-    if (!mqtt_ok) {
-        LOG_WARN("MQTT connection failed, continuing without MQTT");
-    } else {
-        mqtt_client.Subscribe("target_joint_pose");
-        mqtt_client.Subscribe("RobotDynamicStatus");
-        mqtt_client.Subscribe("RobotPosition");
-        mqtt_client.Subscribe("CustomByteBlock", 0);
-        LOG_INFO("MQTT connected and subscribed");
-    }
+    if (!mqtt_ok) LOG_WARN("MQTT connection failed, continuing without MQTT");
 
     double idle_time = 0.0;
     int frame_count = 0;
     auto last_fps_log = std::chrono::steady_clock::now();
 
+    cv::namedWindow("URDF Robot Viewer (MQTT+URDF Renderer)", cv::WINDOW_NORMAL);
+    cv::setMouseCallback("URDF Robot Viewer (MQTT+URDF Renderer)", on_mouse, &orbit_cam);
+
     LOG_INFO("Starting render loop. Send target via MQTT topic 'target_joint_pose' as JSON array.");
-    LOG_INFO("Press 'q' in the window or Ctrl+C to quit.");
+    LOG_INFO("Mouse: left-drag to orbit, scroll to zoom. Press 'q' to quit.");
 
     while (g_running) {
         std::vector<double> traj_positions;
@@ -230,6 +223,8 @@ int main(int argc, char** argv) {
             }
             idle_time += 0.05;
         }
+
+        orbit_cam.apply(renderer);
 
         if (renderer.renderFrame() != drivers::URDF_SUCCESS) {
             LOG_ERROR("Render failed: {}", renderer.getLastError());

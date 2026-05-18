@@ -18,6 +18,7 @@ find_package(urdfdom REQUIRED)
 find_package(Threads REQUIRED)
 find_package(ompl REQUIRED)
 find_package(Eigen3 REQUIRED)
+find_package(Protobuf REQUIRED)
 
 find_library(RUCKIG_LIBRARY ruckig
     PATHS /opt/ros/jazzy/lib/x86_64-linux-gnu
@@ -25,10 +26,12 @@ find_library(RUCKIG_LIBRARY ruckig
 
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/protocol
     ${OGRE_INCLUDE_DIRS}
     ${ASSIMP_INCLUDE_DIRS}
     ${urdfdom_INCLUDE_DIRS}
     ${OMPL_INCLUDE_DIRS}
+    ${Protobuf_INCLUDE_DIRS}
     /opt/ros/jazzy/include
 )
 
@@ -38,6 +41,7 @@ set(SOURCES
     src/driver_urdf_loader.cpp
     src/driver_urdf_renderer.cpp
     src/trajectory_planner.cpp
+    src/protocol/protocol.pb.cc
     src/logger.cpp
 )
 
@@ -54,6 +58,7 @@ target_link_libraries(urdf_mqtt_viewer PRIVATE
     ${OMPL_LIBRARIES}
     ${RUCKIG_LIBRARY}
     Eigen3::Eigen
+    ${Protobuf_LIBRARIES}
 )
 
 add_executable(demo_plan
