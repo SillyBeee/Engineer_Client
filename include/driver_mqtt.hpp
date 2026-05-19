@@ -69,7 +69,6 @@ public:
 
     bool Connect();
     bool Disconnect();
-    void SetConfig(const std::string& ip, int port, const std::string& client_id);
 
     bool Publish(const std::string& topic, const std::string& payload, int qos = 1);
     bool Publish(OutputTopic topic, const std::string& payload, int qos = -1);
@@ -81,7 +80,7 @@ public:
     static const TopicMeta& GetInputTopic(InputTopic t);
     static const TopicMeta& GetOutputTopic(OutputTopic t);
 
-    ~MqttClient();
+    ~MqttClient() = default;
 
 private:
     void InitSubscriber();
@@ -90,11 +89,11 @@ private:
     std::unique_ptr<mqtt::async_client> client_;
     std::unique_ptr<mqtt::callback> client_cb_;
 
+    bool connected_ = false;
     std::string ip_;
     int port_;
     std::string client_id_;
 
-    bool connected_ = false;
     std::mutex handler_mutex_;
     std::function<void(const std::vector<uint8_t>&)> custom_byte_block_handler_;
     std::function<void(const std::string&, const std::string&)> unhandled_topic_callback_;
@@ -108,21 +107,14 @@ class ClientCallback : public virtual mqtt::callback
 {
 public:
     using MsgFn = std::function<void(mqtt::const_message_ptr)>;
-    using ConnFn = std::function<void()>;
-    explicit ClientCallback(MsgFn msg_fn, ConnFn conn_fn = nullptr)
-        : msg_fn_(std::move(msg_fn)), conn_fn_(std::move(conn_fn)) {}
-    void connected(const std::string&) override
-    {
-        LOG_INFO("MQTT connected");
-        if (conn_fn_) conn_fn_();
-    }
+    explicit ClientCallback(MsgFn fn) : fn_(std::move(fn)) {}
     void connection_lost(const std::string& cause) override
     {
         LOG_WARN("MQTT connection lost: {}", cause);
     }
     void message_arrived(mqtt::const_message_ptr msg) override
     {
-        if (msg_fn_) msg_fn_(msg);
+        if (fn_) fn_(msg);
     }
     void delivery_complete(mqtt::delivery_token_ptr token) override
     {
@@ -130,8 +122,7 @@ public:
     }
 
 private:
-    MsgFn msg_fn_;
-    ConnFn conn_fn_;
+    MsgFn fn_;
 };
 
 } // namespace drivers

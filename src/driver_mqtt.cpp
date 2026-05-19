@@ -1,11 +1,8 @@
 #include "driver_mqtt.hpp"
 #include "protocol.pb.h"
 #include <google/protobuf/util/json_util.h>
+#include "logger.hpp"
 #include <chrono>
-
-#ifndef LOG_OUTPUT
-#define LOG_OUTPUT 1
-#endif
 
 namespace drivers
 {
@@ -60,26 +57,8 @@ MqttClient::MqttClient(const std::string& ip, int port, const std::string& clien
     this->ip_ = ip;
     this->port_ = port;
     this->client_id_ = client_id;
-    std::string mqtt_addr = "tcp://" + ip_ + ":" + std::to_string(port_);
+    std::string mqtt_addr = "mqtt://" + ip_ + ":" + std::to_string(port_);
     this->client_ = std::make_unique<mqtt::async_client>(mqtt_addr, client_id_);
-}
-
-void MqttClient::SetConfig(const std::string& ip, int port, const std::string& client_id)
-{
-    this->ip_ = ip;
-    this->port_ = port;
-    this->client_id_ = client_id;
-    std::string mqtt_addr = "tcp://" + ip_ + ":" + std::to_string(port_);
-    this->client_ = std::make_unique<mqtt::async_client>(mqtt_addr, client_id_);
-}
-
-MqttClient::~MqttClient() {
-    try {
-        if (client_) {
-            if (connected_) client_->disconnect()->wait_for(std::chrono::seconds(3));
-            client_->stop_consuming();
-        }
-    } catch (...) {}
 }
 
 bool MqttClient::Connect()
@@ -88,55 +67,61 @@ bool MqttClient::Connect()
     {
         auto connect_options = mqtt::connect_options_builder::v3()
                                    .clean_session(false)
-                                   .connect_timeout(std::chrono::seconds(5))
+                                   .automatic_reconnect()
                                    .finalize();
-        auto msg_fn = std::bind(&MqttClient::MessageCallback, this, std::placeholders::_1);
-        auto conn_fn = std::bind(&MqttClient::InitSubscriber, this);
-        this->client_cb_ = std::make_unique<ClientCallback>(msg_fn, conn_fn);
+        this->client_cb_ = std::make_unique<ClientCallback>(
+            std::bind(&MqttClient::MessageCallback, this, std::placeholders::_1));
         client_->set_callback(*client_cb_);
 
         client_->start_consuming();
         LOG_INFO("Connecting to MQTT server {}:{} ...", ip_, port_);
         auto token = client_->connect(connect_options);
-        token->wait();
-        LOG_INFO("MQTT connected successfully to {}:{}", ip_, port_);
+        auto rsp = token->get_connect_response();
+        if (!rsp.is_session_present())
+        {
+            LOG_INFO("No session present on server. Subscribing...");
+            InitSubscriber();
+        }
         connected_ = true;
+        LOG_INFO("MQTT connected successfully to {}:{}", ip_, port_);
         return true;
     }
     catch (const mqtt::exception& e)
     {
-        LOG_WARN("MQTT connect failed to {}:{} - {}", ip_, port_, e.what());
-        try { client_->stop_consuming(); } catch (...) {}
-        return false;
+        LOG_ERROR("Failed to connect to MQTT broker at {}:{} - {}", ip_, port_, e.what());
     }
+    catch (...)
+    {
+        LOG_ERROR("Unknown error connecting to MQTT broker at {}:{}", ip_, port_);
+    }
+    return false;
 }
 
 bool MqttClient::Disconnect()
 {
     try
     {
-        if (!connected_) { connected_ = false; return true; }
+        if (!connected_) return true;
         LOG_INFO("Disconnecting from MQTT server...");
-        client_->disconnect()->wait_for(std::chrono::seconds(3));
-        client_->stop_consuming();
+        auto token = client_->disconnect();
+        token->wait();
         connected_ = false;
         LOG_INFO("Disconnected from MQTT server.");
         return true;
     }
     catch (const mqtt::exception& e)
     {
-        LOG_WARN("MQTT disconnect: {}", e.what());
+        LOG_ERROR("Failed to disconnect - {}", e.what());
     }
     catch (...)
     {
-        LOG_WARN("MQTT disconnect: unknown error");
+        LOG_ERROR("Unknown error disconnecting");
     }
     return false;
 }
 
 bool MqttClient::Publish(const std::string& topic, const std::string& payload, int qos)
 {
-    const bool enable_log_output = (LOG_OUTPUT == 1);
     try
     {
         if (!client_)
@@ -147,19 +132,12 @@ bool MqttClient::Publish(const std::string& topic, const std::string& payload, i
         auto msg = mqtt::make_message(topic, payload);
         msg->set_qos(qos);
         auto tok = client_->publish(msg);
-        if (tok)
-        {
-            tok->wait();
-        }
-        if (enable_log_output)
-        {
-            LOG_INFO("Published to MQTT topic: {} (qos={})", topic, qos);
-        }
+        if (tok) tok->wait();
         return true;
     }
     catch (const mqtt::exception& e)
     {
-        LOG_ERROR("Failed to publish to {}: what(): {}", topic, e.what());
+        LOG_ERROR("Failed to publish to {} - {}", topic, e.what());
     }
     catch (...)
     {
@@ -185,16 +163,13 @@ bool MqttClient::Subscribe(const std::string& topic, int qos)
             return false;
         }
         auto tok = client_->subscribe(topic, qos);
-        if (tok)
-        {
-            tok->wait();
-        }
+        if (tok) tok->wait();
         LOG_INFO("Subscribed to MQTT topic: {} (qos={})", topic, qos);
         return true;
     }
     catch (const mqtt::exception& e)
     {
-        LOG_ERROR("Failed to subscribe to {}: what(): {}", topic, e.what());
+        LOG_ERROR("Failed to subscribe to {} - {}", topic, e.what());
     }
     catch (...)
     {
@@ -242,286 +217,236 @@ const MqttClient::TopicMeta& MqttClient::GetOutputTopic(OutputTopic t)
 
 void MqttClient::MessageCallback(mqtt::const_message_ptr msg)
 {
-    const bool enable_log_output = (LOG_OUTPUT == 1);
-    if (!msg){return;}
+    if (!msg) return;
 
     std::string topic = msg->get_topic();
     std::string payload = msg->to_string();
-    if (enable_log_output)
-    {
-        LOG_INFO("Received MQTT message on topic: {}", topic);
-    }
 
-    if(topic == GetInputTopic(InputTopic::GAME_STATUS).name){
+    LOG_INFO("Received MQTT message on topic: {}", topic);
+
+    if (topic == GetInputTopic(InputTopic::GAME_STATUS).name) {
         GameStatus status;
         if (status.ParseFromString(payload)) {
-        } else {
-            LOG_ERROR("Failed to parse GameStatus message");
-        }
+            LOG_INFO("GameStatus: stage={} round={}/{} countdown={}",
+                     status.current_stage(), status.current_round(),
+                     status.total_rounds(), status.stage_countdown_sec());
+        } else { LOG_ERROR("Failed to parse GameStatus"); }
     }
 
-    else if (GetInputTopic(InputTopic::GLOBAL_UNIT_STATUS).name == topic){
+    else if (GetInputTopic(InputTopic::GLOBAL_UNIT_STATUS).name == topic) {
         GlobalUnitStatus status;
         if (status.ParseFromString(payload)) {
-            
-        } else {
-            LOG_ERROR("Failed to parse GlobalUnitStatus message");
-        }
+            LOG_INFO("GlobalUnitStatus: base_hp={} robots={}",
+                     status.base_health(), status.robot_health_size());
+        } else { LOG_ERROR("Failed to parse GlobalUnitStatus"); }
     }
 
-    else if (GetInputTopic(InputTopic::GLOBAL_LOGISTICS_STATUS).name == topic){
+    else if (GetInputTopic(InputTopic::GLOBAL_LOGISTICS_STATUS).name == topic) {
         GlobalLogisticsStatus status;
         if (status.ParseFromString(payload)) {
-            
-        } else {
-            LOG_ERROR("Failed to parse GlobalLogisticsStatus message");
-        }
+            LOG_INFO("GlobalLogisticsStatus: economy={} tech={}",
+                     status.remaining_economy(), status.tech_level());
+        } else { LOG_ERROR("Failed to parse GlobalLogisticsStatus"); }
     }
 
-    else if (GetInputTopic(InputTopic::GLOBAL_SPECIAL_MECHANISM).name == topic){
+    else if (GetInputTopic(InputTopic::GLOBAL_SPECIAL_MECHANISM).name == topic) {
         GlobalSpecialMechanism status;
         if (status.ParseFromString(payload)) {
             std::string json;
             google::protobuf::util::MessageToJsonString(status, &json);
-            if (enable_log_output) { LOG_INFO("GlobalSpecialMechanism JSON: {}", json); }
-        } else {
-            LOG_ERROR("Failed to parse GlobalSpecialMechanism message");
-        }
+            LOG_INFO("GlobalSpecialMechanism: {}", json);
+        } else { LOG_ERROR("Failed to parse GlobalSpecialMechanism"); }
     }
 
-    else if (GetInputTopic(InputTopic::EVENT).name == topic){
+    else if (GetInputTopic(InputTopic::EVENT).name == topic) {
         Event status;
         if (status.ParseFromString(payload)) {
             std::string json;
             google::protobuf::util::MessageToJsonString(status, &json);
-            if (enable_log_output) { LOG_INFO("Event JSON: {}", json); }
-        } else {
-            LOG_ERROR("Failed to parse Event message");
-        }
+            LOG_INFO("Event: {}", json);
+        } else { LOG_ERROR("Failed to parse Event"); }
     }
 
-    else if (GetInputTopic(InputTopic::ROBOT_INJURY_STAT).name == topic){
+    else if (GetInputTopic(InputTopic::ROBOT_INJURY_STAT).name == topic) {
         RobotInjuryStat status;
         if (status.ParseFromString(payload)) {
             std::string json;
             google::protobuf::util::MessageToJsonString(status, &json);
-            if (enable_log_output) { LOG_INFO("RobotInjuryStat JSON: {}", json); }
-        } else {
-            LOG_ERROR("Failed to parse RobotInjuryStat message");
-        }
+            LOG_INFO("RobotInjuryStat: {}", json);
+        } else { LOG_ERROR("Failed to parse RobotInjuryStat"); }
     }
 
-    else if (GetInputTopic(InputTopic::ROBOT_RESPAWN_STATUS).name == topic){
+    else if (GetInputTopic(InputTopic::ROBOT_RESPAWN_STATUS).name == topic) {
         RobotRespawnStatus status;
         if (status.ParseFromString(payload)) {
-            
-        } else {
-            LOG_ERROR("Failed to parse RobotRespawnStatus message");
-        }
+            LOG_INFO("RobotRespawnStatus: pending={}", (int)status.is_pending_respawn());
+        } else { LOG_ERROR("Failed to parse RobotRespawnStatus"); }
     }
 
-    else if (GetInputTopic(InputTopic::ROBOT_STATIC_STATUS).name == topic){
+    else if (GetInputTopic(InputTopic::ROBOT_STATIC_STATUS).name == topic) {
         RobotStaticStatus status;
         if (status.ParseFromString(payload)) {
-            
-        } else {
-            LOG_ERROR("Failed to parse RobotStaticStatus message");
-        }
+            LOG_INFO("RobotStaticStatus: robot_id={}", status.robot_id());
+        } else { LOG_ERROR("Failed to parse RobotStaticStatus"); }
     }
-    else if (GetInputTopic(InputTopic::ROBOT_DYNAMIC_STATUS).name == topic){
+
+    else if (GetInputTopic(InputTopic::ROBOT_DYNAMIC_STATUS).name == topic) {
         RobotDynamicStatus status;
         if (status.ParseFromString(payload)) {
-            
-        } else {
-            LOG_ERROR("Failed to parse RobotDynamicStatus message");
-        }
+            LOG_INFO("RobotDynamicStatus: hp={} heat={:.1f} ammo={}",
+                     status.current_health(), status.current_heat(), status.remaining_ammo());
+        } else { LOG_ERROR("Failed to parse RobotDynamicStatus"); }
     }
 
-    else if (GetInputTopic(InputTopic::ROBOT_MODULE_STATUS).name == topic){
+    else if (GetInputTopic(InputTopic::ROBOT_MODULE_STATUS).name == topic) {
         RobotModuleStatus status;
         if (status.ParseFromString(payload)) {
-           
-        } else {
-            LOG_ERROR("Failed to parse RobotModuleStatus message");
-        }
+            LOG_INFO("RobotModuleStatus: power={} rfid={} shooter17={}",
+                     status.power_manager(), status.rfid(), status.small_shooter());
+        } else { LOG_ERROR("Failed to parse RobotModuleStatus"); }
     }
 
-    else if(GetInputTopic(InputTopic::ROBOT_POSITION).name == topic){
+    else if (GetInputTopic(InputTopic::ROBOT_POSITION).name == topic) {
         RobotPosition status;
         if (status.ParseFromString(payload)) {
-            std::string json;
-            google::protobuf::util::MessageToJsonString(status, &json);
-            if (enable_log_output) { LOG_INFO("RobotPosition JSON: {}", json); }
-        } else {
-            LOG_ERROR("Failed to parse RobotPosition message");
-        }
+            LOG_INFO("RobotPosition: robot_id={} x={} y={} yaw={}",
+                     status.robot_id(), status.x(), status.y(), status.yaw());
+        } else { LOG_ERROR("Failed to parse RobotPosition"); }
     }
 
-    else if (GetInputTopic(InputTopic::BUFF).name == topic){
+    else if (GetInputTopic(InputTopic::BUFF).name == topic) {
         Buff status;
         if (status.ParseFromString(payload)) {
-            std::string json;
-            google::protobuf::util::MessageToJsonString(status, &json);
-            if (enable_log_output) { LOG_INFO("Buff JSON: {}", json); }
-        } else {
-            LOG_ERROR("Failed to parse Buff message");
-        }
+            LOG_INFO("Buff: robot_id={} type={} level={}",
+                     status.robot_id(), status.buff_type(), status.buff_level());
+        } else { LOG_ERROR("Failed to parse Buff"); }
     }
 
-    else if(GetInputTopic(InputTopic::PENALTY_INFO).name == topic){
+    else if (GetInputTopic(InputTopic::PENALTY_INFO).name == topic) {
         PenaltyInfo status;
         if (status.ParseFromString(payload)) {
-            std::string json;
-            google::protobuf::util::MessageToJsonString(status, &json);
-            if (enable_log_output) { LOG_INFO("PenaltyInfo JSON: {}", json); }
-        } else {
-            LOG_ERROR("Failed to parse PenaltyInfo message");
-        }
+            LOG_INFO("PenaltyInfo: type={} sec={} num={}",
+                     status.penalty_type(), status.penalty_effect_sec(), status.total_penalty_num());
+        } else { LOG_ERROR("Failed to parse PenaltyInfo"); }
     }
 
-    else if (GetInputTopic(InputTopic::ROBOT_PATH_PLAN_INFO).name == topic){
+    else if (GetInputTopic(InputTopic::ROBOT_PATH_PLAN_INFO).name == topic) {
         RobotPathPlanInfo status;
         if (status.ParseFromString(payload)) {
             std::string json;
             google::protobuf::util::MessageToJsonString(status, &json);
-            if (enable_log_output) { LOG_INFO("RobotPathPlanInfo JSON: {}", json); }
-        } else {
-            LOG_ERROR("Failed to parse RobotPathPlanInfo message");
-        }
+            LOG_INFO("RobotPathPlanInfo: {}", json);
+        } else { LOG_ERROR("Failed to parse RobotPathPlanInfo"); }
     }
 
-    else if (GetInputTopic(InputTopic::RADAR_INFO_TO_CLIENT).name == topic){
+    else if (GetInputTopic(InputTopic::RADAR_INFO_TO_CLIENT).name == topic) {
         RadarInfoToClient status;
         if (status.ParseFromString(payload)) {
             std::string json;
             google::protobuf::util::MessageToJsonString(status, &json);
-            if (enable_log_output) { LOG_INFO("RadarInfoToClient JSON: {}", json); }
-        } else {
-            LOG_ERROR("Failed to parse RadarInfoToClient message");
-        }
+            LOG_INFO("RadarInfoToClient: {}", json);
+        } else { LOG_ERROR("Failed to parse RadarInfoToClient"); }
     }
 
-    else if (GetInputTopic(InputTopic::CUSTOM_BYTE_BLOCK).name == topic){
+    else if (GetInputTopic(InputTopic::CUSTOM_BYTE_BLOCK).name == topic) {
         CustomByteBlock status;
         if (status.ParseFromString(payload)) {
             std::vector<uint8_t> packet_data(status.data().begin(), status.data().end());
-            LOG_INFO("MQTT Get CustomByteBlock");
-            
+            static uint64_t total_packets = 0;
+            ++total_packets;
+            if (total_packets % 100 == 0) {
+                LOG_INFO("MQTT CustomByteBlock: {} packets received", total_packets);
+            }
             std::function<void(const std::vector<uint8_t>&)> handler;
-            {
-                std::lock_guard<std::mutex> lock(handler_mutex_);
-                handler = custom_byte_block_handler_;
-            }
-            if (handler) {
-                handler(packet_data);
-            }
-        } else {
-            LOG_ERROR("Failed to parse CustomByteBlock message");
-        }
+            { std::lock_guard<std::mutex> lock(handler_mutex_); handler = custom_byte_block_handler_; }
+            if (handler) handler(packet_data);
+        } else { LOG_ERROR("Failed to parse CustomByteBlock"); }
     }
 
-    else if (GetInputTopic(InputTopic::MAP_CLICK_INFO_NOTIFY).name == topic){
+    else if (GetInputTopic(InputTopic::MAP_CLICK_INFO_NOTIFY).name == topic) {
         MapClickInfoNotify status;
         if (status.ParseFromString(payload)) {
             std::string json;
             google::protobuf::util::MessageToJsonString(status, &json);
-            if (enable_log_output) { LOG_INFO("MapClickInfoNotify JSON: {}", json); }
-        } else {
-            LOG_ERROR("Failed to parse MapClickInfoNotify message");
-        }
+            LOG_INFO("MapClickInfoNotify: {}", json);
+        } else { LOG_ERROR("Failed to parse MapClickInfoNotify"); }
     }
 
-    else if(GetInputTopic(InputTopic::TECH_CORE_MOTION_STATE_SYNC).name == topic){
+    else if (GetInputTopic(InputTopic::TECH_CORE_MOTION_STATE_SYNC).name == topic) {
         TechCoreMotionStateSync status;
         if (status.ParseFromString(payload)) {
             std::string json;
             google::protobuf::util::MessageToJsonString(status, &json);
-            if (enable_log_output) { LOG_INFO("TechCoreMotionStateSync JSON: {}", json); }
-        } else {
-            LOG_ERROR("Failed to parse TechCoreMotionStateSync message");
-        }
+            LOG_INFO("TechCoreMotionStateSync: {}", json);
+        } else { LOG_ERROR("Failed to parse TechCoreMotionStateSync"); }
     }
 
-    else if (GetInputTopic(InputTopic::ROBOT_PERFORMANCE_SELECTION_SYNC).name == topic){
+    else if (GetInputTopic(InputTopic::ROBOT_PERFORMANCE_SELECTION_SYNC).name == topic) {
         RobotPerformanceSelectionSync status;
         if (status.ParseFromString(payload)) {
             std::string json;
             google::protobuf::util::MessageToJsonString(status, &json);
-            if (enable_log_output) { LOG_INFO("RobotPerformanceSelectionSync JSON: {}", json); }
-        } else {
-            LOG_ERROR("Failed to parse RobotPerformanceSelectionSync message");
-        }
+            LOG_INFO("RobotPerformanceSelectionSync: {}", json);
+        } else { LOG_ERROR("Failed to parse RobotPerformanceSelectionSync"); }
     }
 
-    else if (GetInputTopic(InputTopic::DEPLOY_MODE_STATUS_SYNC).name == topic){
+    else if (GetInputTopic(InputTopic::DEPLOY_MODE_STATUS_SYNC).name == topic) {
         DeployModeStatusSync status;
         if (status.ParseFromString(payload)) {
             std::string json;
             google::protobuf::util::MessageToJsonString(status, &json);
-            if (enable_log_output) { LOG_INFO("DeployModeStatusSync JSON: {}", json); }
-        } else {
-            LOG_ERROR("Failed to parse DeployModeStatusSync message");
-        }
+            LOG_INFO("DeployModeStatusSync: {}", json);
+        } else { LOG_ERROR("Failed to parse DeployModeStatusSync"); }
     }
 
-    else if( GetInputTopic(InputTopic::RUNE_STATUS_SYNC).name == topic){
+    else if (GetInputTopic(InputTopic::RUNE_STATUS_SYNC).name == topic) {
         RuneStatusSync status;
         if (status.ParseFromString(payload)) {
-            
-        } else {
-            LOG_ERROR("Failed to parse RuneStatusSync message");
-        }
+            LOG_INFO("RuneStatusSync: status={} arms={}",
+                     status.rune_status(), status.activated_arms());
+        } else { LOG_ERROR("Failed to parse RuneStatusSync"); }
     }
 
-    else if (GetInputTopic(InputTopic::SENTRY_STATUS_SYNC).name == topic){
+    else if (GetInputTopic(InputTopic::SENTRY_STATUS_SYNC).name == topic) {
         SentryStatusSync status;
         if (status.ParseFromString(payload)) {
-            
-        } else {
-            LOG_ERROR("Failed to parse SentryStatusSync message");
-        }
+            LOG_INFO("SentryStatusSync: posture={} weakened={}",
+                     status.posture_id(), (int)status.is_weakened());
+        } else { LOG_ERROR("Failed to parse SentryStatusSync"); }
     }
 
-    else if (GetInputTopic(InputTopic::DART_SELECT_TARGET_STATUS_SYNC).name == topic){
+    else if (GetInputTopic(InputTopic::DART_SELECT_TARGET_STATUS_SYNC).name == topic) {
         DartSelectTargetStatusSync status;
         if (status.ParseFromString(payload)) {
-            
-        } else {
-            LOG_ERROR("Failed to parse DartSelectTargetStatusSync message");
-        }
+            LOG_INFO("DartSelectTargetStatusSync: target={}", status.target_id());
+        } else { LOG_ERROR("Failed to parse DartSelectTargetStatusSync"); }
     }
 
-    else if (GetInputTopic(InputTopic::SENTRY_CTRL_RESULT).name == topic){
+    else if (GetInputTopic(InputTopic::SENTRY_CTRL_RESULT).name == topic) {
         SentryCtrlResult status;
         if (status.ParseFromString(payload)) {
-           
-        } else {
-            LOG_ERROR("Failed to parse SentryCtrlResult message");
-        }
+            LOG_INFO("SentryCtrlResult: cmd={} result={}", status.command_id(), status.result_code());
+        } else { LOG_ERROR("Failed to parse SentryCtrlResult"); }
     }
 
-    else if (GetInputTopic(InputTopic::AIR_SUPPORT_STATUS_SYNC).name == topic){
+    else if (GetInputTopic(InputTopic::AIR_SUPPORT_STATUS_SYNC).name == topic) {
         AirSupportStatusSync status;
         if (status.ParseFromString(payload)) {
             std::string json;
             google::protobuf::util::MessageToJsonString(status, &json);
-            if (enable_log_output) { LOG_INFO("AirSupportStatusSync JSON: {}", json); }
-        } else {
-            LOG_ERROR("Failed to parse AirSupportStatusSync message");
-        }
+            LOG_INFO("AirSupportStatusSync: {}", json);
+        } else { LOG_ERROR("Failed to parse AirSupportStatusSync"); }
     }
 
-    else if(topic.empty()){
-        if (enable_log_output) { LOG_WARN("Received MQTT message with empty topic"); }
+    else if (topic.empty()) {
+        LOG_WARN("Received MQTT message with empty topic");
     }
-    else{
-        if (enable_log_output) { LOG_WARN("Received MQTT message on unknown topic: {}", topic); }
+    else {
+        LOG_WARN("Received MQTT message on unknown topic: {}", topic);
         if (unhandled_topic_callback_) {
             unhandled_topic_callback_(topic, payload);
         }
     }
-
 }
-
 
 } // namespace drivers
