@@ -28,6 +28,11 @@ public:
         const std::vector<double>& target_positions,
         double planning_time_sec = 5.0);
 
+    JointTrajectory PlanToPose(
+        const std::vector<double>& current_positions,
+        const double target_xyzrpy[6],
+        double planning_time_sec = 5.0);
+
     std::vector<std::string> getJointNames() const { return joint_names_; }
     std::vector<double> getLowerBounds() const { return lower_bounds_; }
     std::vector<double> getUpperBounds() const { return upper_bounds_; }

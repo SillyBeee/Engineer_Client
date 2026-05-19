@@ -129,19 +129,6 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    drivers::MqttClient mqtt_client(mqtt_host, mqtt_port, mqtt_client_id);
-    if (!mqtt_client.Connect()) {
-        LOG_ERROR("MQTT connection failed, exiting");
-        return 1;
-    }
-
-    mqtt_client.SetCustomByteBlockHandler(
-        [&](const std::vector<uint8_t>& data) {
-            size_t copy_bytes = std::min(data.size(), sizeof(current_arm_jpos));
-            memcpy(current_arm_jpos, data.data(), copy_bytes);
-        }
-    );
-
     drivers::URDFRendererPlugin renderer;
     drivers::UrdfRenderConfig render_cfg;
     render_cfg.width = 800;
@@ -173,6 +160,82 @@ int main(int argc, char** argv) {
     auto joint_names = planner.getJointNames();
     size_t num_joints = joint_names.size();
 
+    TrajectoryExecutor executor;
+    std::mutex traj_mutex;
+    bool trajectory_active = false;
+    std::vector<double> traj_current_positions(num_joints, 0.0);
+
+    drivers::MqttClient mqtt_client(mqtt_host, mqtt_port, mqtt_client_id);
+    if (!mqtt_client.Connect()) {
+        LOG_ERROR("MQTT connection failed, exiting");
+        return 1;
+    }
+
+    mqtt_client.SetCustomByteBlockHandler(
+        [&](const std::vector<uint8_t>& data) {
+            if (data.size() < 3) return;
+
+            std::string_view header(reinterpret_cast<const char*>(data.data()), 3);
+            const uint8_t* payload = data.data() + 3;
+            size_t payload_size = data.size() - 3;
+
+            if (header == "aaa") {
+                size_t num_floats = payload_size / sizeof(float);
+                if (num_floats < 1) return;
+                std::vector<double> target_joints(num_floats);
+                const float* fdata = reinterpret_cast<const float*>(payload);
+                for (size_t i = 0; i < num_floats; ++i) target_joints[i] = fdata[i];
+
+                LOG_INFO("CustomByteBlock[aaa]: planning to {} joint targets", num_floats);
+
+                std::vector<double> current_pos(num_joints, 0.0);
+                {
+                    std::lock_guard<std::mutex> lock(traj_mutex);
+                    current_pos = traj_current_positions;
+                }
+
+                std::vector<double> plan_target(num_joints, 0.0);
+                for (size_t i = 0; i < std::min(num_floats, num_joints); ++i) {
+                    plan_target[i] = target_joints[i];
+                }
+                JointTrajectory traj = planner.PlanToTarget(current_pos, plan_target, 3.0);
+                if (!traj.points.empty()) {
+                    std::lock_guard<std::mutex> lock(traj_mutex);
+                    executor.Start(traj);
+                    trajectory_active = true;
+                    LOG_INFO("Trajectory started: {} points", traj.points.size());
+                }
+            } else if (header == "bbb") {
+                if (payload_size < 6 * sizeof(float)) return;
+                const float* fdata = reinterpret_cast<const float*>(payload);
+                double target_xyzrpy[6] = {
+                    fdata[0], fdata[1], fdata[2], fdata[3], fdata[4], fdata[5]
+                };
+
+                LOG_INFO("CustomByteBlock[bbb]: planning to pose ({:.3f} {:.3f} {:.3f}, {:.3f} {:.3f} {:.3f})",
+                         target_xyzrpy[0], target_xyzrpy[1], target_xyzrpy[2],
+                         target_xyzrpy[3], target_xyzrpy[4], target_xyzrpy[5]);
+
+                std::vector<double> current_pos(num_joints, 0.0);
+                {
+                    std::lock_guard<std::mutex> lock(traj_mutex);
+                    current_pos = traj_current_positions;
+                }
+
+                JointTrajectory traj = planner.PlanToPose(current_pos, target_xyzrpy, 3.0);
+                if (!traj.points.empty()) {
+                    std::lock_guard<std::mutex> lock(traj_mutex);
+                    executor.Start(traj);
+                    trajectory_active = true;
+                    LOG_INFO("Trajectory started: {} points", traj.points.size());
+                }
+            } else {
+                size_t copy_bytes = std::min(data.size(), sizeof(current_arm_jpos));
+                memcpy(current_arm_jpos, data.data(), copy_bytes);
+            }
+        }
+    );
+
     int frame_count = 0;
     auto last_fps_log = std::chrono::steady_clock::now();
 
@@ -183,9 +246,35 @@ int main(int argc, char** argv) {
     LOG_INFO("Mouse: left-drag to orbit, scroll to zoom. Press 'q' to quit.");
 
     while (g_running) {
-        size_t render_joints = std::min(num_joints, sizeof(current_arm_jpos) / sizeof(current_arm_jpos[0]));
-        for (size_t i = 0; i < render_joints; ++i) {
-            renderer.setJointAngle(joint_names[i], current_arm_jpos[i]);
+        std::vector<double> traj_positions;
+        bool on_trajectory = false;
+        {
+            std::lock_guard<std::mutex> lock(traj_mutex);
+            on_trajectory = executor.GetCurrentPosition(traj_positions);
+            if (!on_trajectory && trajectory_active) {
+                trajectory_active = false;
+                LOG_INFO("Trajectory completed");
+            }
+        }
+
+        if (on_trajectory) {
+            for (size_t i = 0; i < std::min(num_joints, traj_positions.size()); ++i) {
+                renderer.setJointAngle(joint_names[i], traj_positions[i]);
+            }
+            {
+                std::lock_guard<std::mutex> lock(traj_mutex);
+                traj_current_positions = traj_positions;
+            }
+        } else {
+            size_t render_joints = std::min(num_joints, sizeof(current_arm_jpos) / sizeof(current_arm_jpos[0]));
+            for (size_t i = 0; i < render_joints; ++i) {
+                renderer.setJointAngle(joint_names[i], current_arm_jpos[i]);
+            }
+            {
+                std::lock_guard<std::mutex> lock(traj_mutex);
+                for (size_t i = 0; i < render_joints; ++i)
+                    traj_current_positions[i] = current_arm_jpos[i];
+            }
         }
 
         orbit_cam.apply(renderer);

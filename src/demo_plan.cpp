@@ -9,6 +9,7 @@
 #include <csignal>
 #include <atomic>
 #include <mutex>
+#include <thread>
 
 static std::atomic<bool> g_running{true};
 static void signal_handler(int) { g_running = false; }
@@ -81,23 +82,26 @@ static void on_mouse(int event, int x, int y, int flags, void* userdata) {
 
 static void print_usage(const char* prog) {
     fprintf(stderr,
-        "Usage: %s [options] <j1> <j2> ... <j9>\n"
+        "Usage: %s [options] --joint <j1> ... <jN>\n"
+        "   or: %s [options] --pose <x> <y> <z> <roll> <pitch> <yaw>\n"
         "Options:\n"
-        "  --urdf PATH      URDF file path\n"
-        "  --degrees        Input angles in degrees (default: radians)\n"
-        "  --plan-time SEC  OMPL planning time (default: 5.0)\n"
-        "  --repeat         Loop the trajectory\n"
-        "  --help           Show this help\n"
+        "  --urdf PATH       URDF file path\n"
+        "  --plan-time SEC   OMPL planning time (default: 5.0)\n"
+        "  --repeat          Loop the trajectory\n"
+        "  --joint           Plan to target joint angles (default if no --pose)\n"
+        "  --pose            Plan to target end-effector pose (xyzrpy)\n"
+        "  --degrees         Input angles in degrees (only for --joint, default: rad)\n"
+        "  --help            Show this help\n"
         "\n"
-        "Example (radians):\n"
-        "  %s 0.5 -0.3 0.8 -0.2 0.6 -0.4 0.3 -0.1 0.2\n"
-        "Example (degrees):\n"
-        "  %s --degrees 30 -20 45 -15 35 -25 20 -10 15\n"
+        "Examples:\n"
+        "  %s --joint 0.5 -0.3 0.8 -0.2 0.6 -0.4 0.3 -0.1 0.2\n"
+        "  %s --degrees --joint 30 -20 45 -15 35 -25 20 -10 15\n"
+        "  %s --pose 0.30 0.0 0.45 0.0 0.0 0.0\n"
         "\n"
         "Mouse controls:\n"
         "  Left drag: orbit\n"
         "  Scroll: zoom\n",
-        prog, prog, prog);
+        prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char** argv) {
@@ -111,8 +115,9 @@ int main(int argc, char** argv) {
     double planning_time = 5.0;
     bool degrees = false;
     bool repeat = false;
+    bool pose_mode = false;
 
-    std::vector<double> target_angles;
+    std::vector<double> values;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--urdf") == 0 && i + 1 < argc) {
             urdf_path = argv[++i];
@@ -122,22 +127,22 @@ int main(int argc, char** argv) {
             degrees = true;
         } else if (strcmp(argv[i], "--repeat") == 0) {
             repeat = true;
+        } else if (strcmp(argv[i], "--pose") == 0) {
+            pose_mode = true;
+        } else if (strcmp(argv[i], "--joint") == 0) {
+            pose_mode = false;
         } else if (strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;
         } else {
-            target_angles.push_back(std::stod(argv[i]));
+            values.push_back(std::stod(argv[i]));
         }
     }
 
-    if (target_angles.empty()) {
-        fprintf(stderr, "No target angles provided.\n\n");
+    if (values.empty()) {
+        fprintf(stderr, "No target values provided.\n\n");
         print_usage(argv[0]);
         return 1;
-    }
-
-    if (degrees) {
-        for (auto& a : target_angles) a = a * M_PI / 180.0;
     }
 
     if (!std::filesystem::exists(urdf_path)) {
@@ -176,20 +181,50 @@ int main(int argc, char** argv) {
     }
 
     size_t num_joints = planner.num_joints();
-    if (target_angles.size() != num_joints) {
-        LOG_ERROR("Expected {} joint angles, got {}", num_joints, target_angles.size());
-        return 1;
-    }
-
     auto joint_names = planner.getJointNames();
     std::vector<double> zero_angles(num_joints, 0.0);
+    TrajectoryExecutor executor;
 
-    LOG_INFO("Planning from all-zero to target:");
-    for (size_t i = 0; i < num_joints; ++i) {
-        LOG_INFO("  {}: 0.0 -> {:.4f}", joint_names[i], target_angles[i]);
+    JointTrajectory traj;
+
+    if (pose_mode) {
+        if (values.size() != 6) {
+            LOG_ERROR("Pose mode expects 6 values (x y z roll pitch yaw), got {}", values.size());
+            return 1;
+        }
+
+        if (degrees) {
+            LOG_WARN("--degrees ignored in pose mode");
+        }
+
+        double target_xyzrpy[6] = {
+            values[0], values[1], values[2],
+            values[3], values[4], values[5]
+        };
+
+        LOG_INFO("Planning from zero to end-effector pose:");
+        LOG_INFO("  pos:  {:.4f}  {:.4f}  {:.4f}", target_xyzrpy[0], target_xyzrpy[1], target_xyzrpy[2]);
+        LOG_INFO("  rpy:  {:.4f}  {:.4f}  {:.4f}", target_xyzrpy[3], target_xyzrpy[4], target_xyzrpy[5]);
+
+        traj = planner.PlanToPose(zero_angles, target_xyzrpy, planning_time);
+
+    } else {
+        if (values.size() != num_joints) {
+            LOG_ERROR("Joint mode expects {} values, got {}", num_joints, values.size());
+            return 1;
+        }
+
+        if (degrees) {
+            for (auto& a : values) a = a * M_PI / 180.0;
+        }
+
+        LOG_INFO("Planning from all-zero to target:");
+        for (size_t i = 0; i < num_joints; ++i) {
+            LOG_INFO("  {}: 0.0 -> {:.4f}", joint_names[i], values[i]);
+        }
+
+        traj = planner.PlanToTarget(zero_angles, values, planning_time);
     }
-
-    auto traj = planner.PlanToTarget(zero_angles, target_angles, planning_time);
 
     if (traj.points.empty()) {
         LOG_ERROR("Planning returned empty trajectory");
@@ -199,7 +234,6 @@ int main(int argc, char** argv) {
     LOG_INFO("Trajectory: {} points, {:.2f}s duration",
              traj.points.size(), traj.points.back().time_from_start);
 
-    TrajectoryExecutor executor;
     std::vector<double> current_pos = zero_angles;
     int frame_count = 0;
     auto last_fps_log = std::chrono::steady_clock::now();
