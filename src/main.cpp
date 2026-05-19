@@ -16,7 +16,7 @@ using json = nlohmann::json;
 
 static std::atomic<bool> g_running{true};
 static void signal_handler(int) { g_running = false; }
-
+float current_arm_jpos[9] = {};
 struct OrbitCamera {
     double distance = 2.74;
     double yaw = -0.32;
@@ -135,6 +135,13 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    mqtt_client.SetCustomByteBlockHandler(
+        [&](const std::vector<uint8_t>& data) {
+            size_t copy_bytes = std::min(data.size(), sizeof(current_arm_jpos));
+            memcpy(current_arm_jpos, data.data(), copy_bytes);
+        }
+    );
+
     drivers::URDFRendererPlugin renderer;
     drivers::UrdfRenderConfig render_cfg;
     render_cfg.width = 800;
@@ -166,13 +173,6 @@ int main(int argc, char** argv) {
     auto joint_names = planner.getJointNames();
     size_t num_joints = joint_names.size();
 
-    TrajectoryExecutor executor;
-    std::mutex traj_mutex;
-    std::vector<double> current_joint_positions(num_joints, 0.0);
-
-
-
-    double idle_time = 0.0;
     int frame_count = 0;
     auto last_fps_log = std::chrono::steady_clock::now();
 
@@ -183,34 +183,9 @@ int main(int argc, char** argv) {
     LOG_INFO("Mouse: left-drag to orbit, scroll to zoom. Press 'q' to quit.");
 
     while (g_running) {
-        std::vector<double> traj_positions;
-        bool on_trajectory = false;
-
-        {
-            std::lock_guard<std::mutex> lock(traj_mutex);
-            on_trajectory = executor.GetCurrentPosition(traj_positions);
-        }
-
-        if (on_trajectory) {
-            for (size_t i = 0; i < num_joints; ++i) {
-                renderer.setJointAngle(joint_names[i], traj_positions[i]);
-            }
-            {
-                std::lock_guard<std::mutex> lock(traj_mutex);
-                current_joint_positions = traj_positions;
-            }
-        } else {
-            for (size_t i = 0; i < num_joints; ++i) {
-                double angle = 0.3 * std::sin(idle_time + i * 0.5);
-                renderer.setJointAngle(joint_names[i], angle);
-            }
-            {
-                std::lock_guard<std::mutex> lock(traj_mutex);
-                for (size_t i = 0; i < num_joints; ++i) {
-                    current_joint_positions[i] = 0.3 * std::sin(idle_time + i * 0.5);
-                }
-            }
-            idle_time += 0.05;
+        size_t render_joints = std::min(num_joints, sizeof(current_arm_jpos) / sizeof(current_arm_jpos[0]));
+        for (size_t i = 0; i < render_joints; ++i) {
+            renderer.setJointAngle(joint_names[i], current_arm_jpos[i]);
         }
 
         orbit_cam.apply(renderer);
